@@ -27,11 +27,21 @@ const GESTURE_ICONS = {
   'None':             '🤚',
 };
 
+const GESTURE_TO_LETTER = {
+  'Victory':     'V',
+  'Pointing Up': 'I',
+  'Thumb Up':    'A',
+  'Thumb Down':  'B',
+  'Closed Fist': 'E',
+  'Iloveyou':    'L',
+  'Open Palm':   'O'
+};
+
 const prettifyGesture = (raw) =>
   raw.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
 
-// ─── VideoNode ────────────────────────────────────────────────────────────────
-const VideoNode = React.memo(({ peer, name }) => {
+// ─── VideoNode Component ──────────────────────────────────────────────────────
+const VideoNode = React.memo(({ peer, name, isSelected, onClick }) => {
   const vidRef = useRef();
 
   useEffect(() => {
@@ -47,7 +57,11 @@ const VideoNode = React.memo(({ peer, name }) => {
   }, [peer]);
 
   return (
-    <div className="participant-card active-speaker">
+    <div 
+      className={`participant-card ${isSelected ? 'selected-focus-border' : 'active-speaker'}`}
+      onClick={onClick}
+      style={{ cursor: 'pointer' }}
+    >
       <div className="remote-video-wrap">
         <video ref={vidRef} autoPlay playsInline />
       </div>
@@ -78,6 +92,11 @@ const VideoCall = () => {
   const [modelStatus,    setModelStatus]    = useState('idle');
   
   const [accumulatedWord, setAccumulatedWord] = useState('');
+  const [showWelcomeModal, setShowWelcomeModal] = useState(true);
+  const [isMuted,        setIsMuted]        = useState(false);
+
+  // 🌟 Theater Mode Layout Active Selection Tracking States
+  const [selectedPeerId, setSelectedPeerId] = useState(null);
 
   const localVidRef      = useRef(null);
   const canvasRef        = useRef(null);
@@ -91,15 +110,47 @@ const VideoCall = () => {
   const lastGestureRef   = useRef('None');
   const lastVideoTimeRef = useRef(-1);
   
-  // Throttle tracking reference: Limits predictions to 1 per second
   const lastProcessingTimeRef = useRef(0);
-  const wordBufferRef    = useRef('');
+  const wordBufferRef          = useRef('');
+  
+  const gestureHistoryRef     = useRef([]);
+  const lastAppendedSignRef   = useRef('');
+  const appendCooldownRef      = useRef(0);
+
+  // Big Grid Ref for Theater view mirroring
+  const theaterVidRef        = useRef(null);
 
   const userName = localStorage.getItem('userName') || 'User';
 
   useEffect(() => { historyRef.current = historyFeed; }, [historyFeed]);
 
-  // ── Load MediaPipe model ─────────────────────────────────────────────────
+  // 🌟 Handle Mirroring the Active selected user into the main center screen
+  useEffect(() => {
+    if (!theaterVidRef.current) return;
+    
+    if (selectedPeerId) {
+      const targetRecord = peersRef.current.get(selectedPeerId);
+      const targetStream = targetRecord?.peer?.streams?.[0];
+      if (targetStream) {
+        theaterVidRef.current.srcObject = targetStream;
+        theaterVidRef.current.play().catch(() => {});
+        return;
+      }
+    }
+    // Fallback to null if peer goes missing
+    theaterVidRef.current.srcObject = null;
+  }, [selectedPeerId, activePeers]);
+
+  const speakText = (textToSpeak) => {
+    if ('speechSynthesis' in window) {
+      window.speechSynthesis.cancel(); 
+      const utterance = new SpeechSynthesisUtterance(textToSpeak);
+      utterance.rate = 1.0;  
+      utterance.pitch = 1.0; 
+      window.speechSynthesis.speak(utterance);
+    }
+  };
+
   useEffect(() => {
     let cancelled = false;
     const loadModel = async () => {
@@ -114,7 +165,7 @@ const VideoCall = () => {
             delegate: 'GPU',   
           },
           runningMode: 'VIDEO',
-          numHands: 1,
+          numHands: 2,
           minHandDetectionConfidence: 0.5,
           minHandPresenceConfidence: 0.5,
           minTrackingConfidence: 0.5,
@@ -132,7 +183,6 @@ const VideoCall = () => {
     return () => { cancelled = true; };
   }, []);
 
-  // ── Broadcast Completed Sign Words ────────────────────────────────────────
   const dispatchSignWord = useCallback(() => {
     const finalWord = wordBufferRef.current.trim();
     if (!finalWord) return;
@@ -152,11 +202,13 @@ const VideoCall = () => {
       ...prev.slice(0, 49)
     ]);
 
+    speakText(finalWord);
+
     wordBufferRef.current = '';
     setAccumulatedWord('');
+    lastAppendedSignRef.current = ''; 
   }, [currentRoomId, userName]);
 
-  // ── Push characters or process Space triggers ───────────────────────────
   const processLiveGesture = useCallback((sign, confStr) => {
     const rawSign = sign.replace(/ /g, '_');
     
@@ -167,13 +219,20 @@ const VideoCall = () => {
 
     if (rawSign === 'None') return;
 
-    let characterToken = sign;
-    if (sign.length > 2) {
-      characterToken = sign.charAt(0).toUpperCase(); 
+    if (sign === lastAppendedSignRef.current && Date.now() - appendCooldownRef.current < 2000) {
+      return; 
+    }
+
+    let characterToken = GESTURE_TO_LETTER[sign] || sign;
+    if (characterToken.length > 2) {
+      characterToken = characterToken.charAt(0).toUpperCase(); 
     }
 
     wordBufferRef.current += characterToken;
     setAccumulatedWord(wordBufferRef.current);
+    
+    lastAppendedSignRef.current = sign;
+    appendCooldownRef.current = Date.now();
 
     const confNum = parseFloat(confStr);
     setStats(prev => ({
@@ -183,14 +242,12 @@ const VideoCall = () => {
     }));
   }, [dispatchSignWord]);
 
-  // ── MediaPipe inference loop with 1-Second Throttler ─────────────────────
   const runGestureLoop = useCallback(() => {
     if (!isRunningRef.current) return;
     const video = localVidRef.current;
     const recognizer = gestureRef.current;
 
     const now = performance.now();
-    // 1000ms ensures exactly 1 processing run per second
     const timeDelta = now - lastProcessingTimeRef.current; 
 
     if (
@@ -198,17 +255,17 @@ const VideoCall = () => {
       video && 
       video.readyState >= 2 && 
       video.currentTime !== lastVideoTimeRef.current &&
-      timeDelta >= 500 
+      timeDelta >= 400 
     ) {
       lastVideoTimeRef.current = video.currentTime;
       lastProcessingTimeRef.current = now; 
 
       try {
-        const results = recognizer.recognizeForVideo(video, Date.now());
-        if (results.gestures && results.gestures.length > 0) {
+        const MathResults = recognizer.recognizeForVideo(video, Date.now());
+        if (MathResults.gestures && MathResults.gestures.length > 0) {
           let bestGesture = null;
           let bestScore   = 0;
-          results.gestures.forEach(handGestures => {
+          MathResults.gestures.forEach(handGestures => {
             if (handGestures.length > 0 && handGestures[0].score > bestScore) {
               bestScore   = handGestures[0].score;
               bestGesture = handGestures[0].categoryName;
@@ -218,26 +275,45 @@ const VideoCall = () => {
           if (bestGesture) {
             const pretty = prettifyGesture(bestGesture);
             const confStr = bestScore.toFixed(2);
-            setCurrentGesture(pretty);
-            setConfidence(confStr);
 
-            if (bestGesture !== lastGestureRef.current) {
-              lastGestureRef.current = bestGesture;
-              processLiveGesture(pretty, confStr);
+            gestureHistoryRef.current.push(pretty);
+            if (gestureHistoryRef.current.length > 3) {
+              gestureHistoryRef.current.shift();
             }
-            drawLandmarks(results);
+
+            const allMatch = gestureHistoryRef.current.every(g => g === pretty);
+
+            if (allMatch) {
+              setCurrentGesture(pretty);
+              setConfidence(confStr);
+
+              if (pretty !== lastGestureRef.current) {
+                lastGestureRef.current = pretty;
+                processLiveGesture(pretty, confStr);
+              }
+            }
+            drawLandmarks(MathResults);
           } else {
-            setCurrentGesture('None');
-            clearCanvas();
+            handleEmptyFrame();
           }
         } else {
-          setCurrentGesture('None');
-          clearCanvas();
+          handleEmptyFrame();
         }
       } catch (err) {}
     }
     rafRef.current = requestAnimationFrame(runGestureLoop);
   }, [processLiveGesture]);
+
+  const handleEmptyFrame = () => {
+    gestureHistoryRef.current.push('None');
+    if (gestureHistoryRef.current.length > 3) gestureHistoryRef.current.shift();
+    
+    if (gestureHistoryRef.current.every(g => g === 'None')) {
+      setCurrentGesture('None');
+      lastGestureRef.current = 'None';
+    }
+    clearCanvas();
+  };
 
   const drawLandmarks = (results) => {
     const canvas = canvasRef.current;
@@ -251,7 +327,7 @@ const VideoCall = () => {
 
     const CONNECTIONS = [
       [0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],
-      [0,9],[9,10],[10,11],[11,12],[0,13],[13,14],[14,15],[15,16],
+      [0,9],[9,10],[10,11],[11,12],[0,13],[13,14],[14,15],[14,16],
       [0,17],[17,18],[18,19],[19,20],[5,9],[9,13],[13,17],
     ];
 
@@ -293,18 +369,26 @@ const VideoCall = () => {
     });
     peer.on('stream',  () => syncPeers());
     peer.on('connect', () => syncPeers());
-    peer.on('close',   () => { peersRef.current.delete(remoteId); syncPeers(); });
+    peer.on('close',   () => { 
+      peersRef.current.delete(remoteId); 
+      if (selectedPeerId === remoteId) setSelectedPeerId(null);
+      syncPeers(); 
+    });
     peer.on('error',   err => console.warn('[peer error]', err.message));
 
     if (!initiator && incomingSignal) peer.signal(incomingSignal);
     return peer;
-  }, [syncPeers]);
+  }, [syncPeers, selectedPeerId]);
 
   const startCamera = async () => {
     if (isRunningRef.current) return;
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
       streamRef.current = stream;
+
+      stream.getAudioTracks().forEach(track => {
+        track.enabled = !isMuted;
+      });
 
       if (localVidRef.current) {
         localVidRef.current.srcObject = stream;
@@ -331,18 +415,29 @@ const VideoCall = () => {
           { id: Date.now(), type: 'chat', icon: '💬', text: `${senderName}: ${msg}`, meta: ts },
           ...prev.slice(0, 49)
         ]);
+
+        if (msg.startsWith('[Sign]')) {
+          speakText(`${senderName} says: ${msg.replace('[Sign]', '')}`);
+        } else {
+          speakText(`${senderName} chats: ${msg}`);
+        }
       });
 
+      // 🌟 FIX: Full instant array synchronization prevents connection drops for 4+ users
       socket.on('allUsers', users => {
         users.forEach(user => {
           if (peersRef.current.has(user.id)) return;
           const peer = makePeer({ remoteId: user.id, initiator: true, stream: streamRef.current });
           peersRef.current.set(user.id, { peer, name: user.name });
         });
+        syncPeers();
       });
 
       socket.on('userJoined', ({ id, name }) => {
-        if (!peersRef.current.has(id)) peersRef.current.set(id, { peer: null, name });
+        if (!peersRef.current.has(id)) {
+          peersRef.current.set(id, { peer: null, name });
+          syncPeers();
+        }
       });
 
       socket.on('signal', ({ from, signal }) => {
@@ -355,6 +450,7 @@ const VideoCall = () => {
             incomingSignal: signal,
           });
           peersRef.current.set(from, { peer, name: record?.name || 'Peer' });
+          syncPeers();
         } else {
           try { record.peer.signal(signal); } catch (e) {}
         }
@@ -364,11 +460,22 @@ const VideoCall = () => {
         const r = peersRef.current.get(id);
         if (r?.peer) r.peer.destroy();
         peersRef.current.delete(id);
+        if (selectedPeerId === id) setSelectedPeerId(null);
         syncPeers();
       });
 
     } catch (err) {
       console.error('[startCamera]', err);
+    }
+  };
+
+  const toggleMute = () => {
+    const nextMuteState = !isMuted;
+    setIsMuted(nextMuteState);
+    if (streamRef.current) {
+      streamRef.current.getAudioTracks().forEach(track => {
+        track.enabled = !nextMuteState;
+      });
     }
   };
 
@@ -378,6 +485,8 @@ const VideoCall = () => {
     setCurrentGesture('None');
     setConfidence('—');
     lastGestureRef.current = 'None';
+    setIsMuted(false); 
+    setSelectedPeerId(null);
     cancelAnimationFrame(rafRef.current);
     clearCanvas();
 
@@ -391,7 +500,7 @@ const VideoCall = () => {
 
     socketRef.current?.disconnect();
     socketRef.current = null;
-  }, []);
+  }, [selectedPeerId]);
 
   const copyInviteLink = () => {
     navigator.clipboard.writeText(`${window.location.origin}/workspace?room=${currentRoomId}`)
@@ -412,6 +521,8 @@ const VideoCall = () => {
       { id: Date.now(), type: 'chat', icon: '💬', text: `You: ${chatMessage}`, meta: ts },
       ...prev.slice(0, 49)
     ]);
+
+    speakText(`You said: ${chatMessage}`);
     setChatMessage('');
   };
 
@@ -443,6 +554,39 @@ const VideoCall = () => {
 
   return (
     <div className="app-shell">
+      {showWelcomeModal && (
+        <div className="modal-overlay">
+          <div className="modal-content">
+            <div className="modal-header">
+              <h2>Welcome to the Sign Workspace, {userName}! 👋</h2>
+              <div className="underline"></div>
+            </div>
+            <div className="modal-body">
+              <p>Your collaborative workspace room is set up. Keep these live operational tips in mind before initializing:</p>
+              <ul className="modal-guidelines">
+                <li>
+                  <span className="bullet-icon">🔊</span> 
+                  <strong>Text-to-Speech Engine:</strong> Integrated browser speech utilities will automatically speak all translated messages out loud!
+                </li>
+                <li>
+                  <span className="bullet-icon">🖥️</span> 
+                  <strong>Theater Sizing:</strong> Click on any user's bottom profile layout card to magnify their video feed onto the large primary projection grid panel.
+                </li>
+                <li>
+                  <span className="bullet-icon">⏹️</span> 
+                  <strong>Broadcasting Text:</strong> Flash the <strong>"Space"</strong> hand configuration to immediately pack your buffer and relay the translated text across the room.
+                </li>
+              </ul>
+            </div>
+            <div className="modal-footer">
+              <button className="modal-start-btn" onClick={() => setShowWelcomeModal(false)}>
+                Enter Workspace & Start Room
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       <section className="video-section">
         <div className="video-header">
           <div className="header-left">
@@ -467,19 +611,38 @@ const VideoCall = () => {
           <div className="header-title">Sign Language Interpreter Module</div>
         </div>
 
+        {/* Primary View Container (Changes dynamically based on user selection) */}
         <div className="main-feed-wrap">
-          <video ref={localVidRef} id="webcam" autoPlay playsInline muted
-            style={{ display: isRunning ? 'block' : 'none' }} />
-          <canvas ref={canvasRef} id="overlay"
+          <video 
+            ref={theaterVidRef} 
+            className="theater-view-element" 
+            style={{ display: selectedPeerId ? 'block' : 'none' }} 
+            autoPlay 
+            playsInline 
+          />
+          
+          <video 
+            ref={localVidRef} 
+            id="webcam" 
+            autoPlay 
+            playsInline 
+            muted
+            style={{ display: (!selectedPeerId && isRunning) ? 'block' : 'none' }} 
+          />
+          
+          <canvas 
+            ref={canvasRef} 
+            id="overlay"
             style={{
-              display: isRunning ? 'block' : 'none',
+              display: !selectedPeerId && isRunning ? 'block' : 'none',
               position: 'absolute', inset: 0,
               width: '100%', height: '100%',
               pointerEvents: 'none',
               transform: 'scaleX(-1)',   
             }}
           />
-          {!isRunning && (
+          
+          {(!isRunning && !selectedPeerId) && (
             <div className="feed-placeholder">
               <div className="placeholder-text">
                 {modelStatus === 'loading'
@@ -508,26 +671,56 @@ const VideoCall = () => {
           </div>
         </div>
 
+        {/* Multi-User Flex Rows Grid */}
         <div className="participants-row">
-          <div className="participant-card active-speaker">
+          <div 
+            className={`participant-card ${!selectedPeerId ? 'selected-focus-border' : 'active-speaker'}`}
+            onClick={() => setSelectedPeerId(null)}
+            style={{ cursor: 'pointer' }}
+          >
             <div className="remote-video-wrap local-avatar-wrap">
-              <div className="participant-avatar">ME</div>
+              {selectedPeerId && isRunning ? (
+                <video 
+                  srcObject={streamRef.current} 
+                  autoPlay 
+                  playsInline 
+                  muted 
+                  style={{ width: '100%', height: '100%', objectFit: 'cover', transform: 'scaleX(-1)' }}
+                  ref={(el) => { if (el && streamRef.current) el.srcObject = streamRef.current; }}
+                />
+              ) : (
+                <div className="participant-avatar">ME</div>
+              )}
             </div>
             <span className="participant-name">{userName} (You)</span>
             <div className="participant-status active" />
           </div>
+          
           {activePeers.map(p => (
-            <VideoNode key={p.peerId} peer={p.peer} name={p.name} />
+            <VideoNode 
+              key={p.peerId} 
+              peer={p.peer} 
+              name={p.name} 
+              isSelected={selectedPeerId === p.peerId}
+              onClick={() => setSelectedPeerId(p.peerId)}
+            />
           ))}
         </div>
 
         <div className="control-bar">
           <button className="ctrl-btn" onClick={startCamera}
             disabled={isRunning || modelStatus === 'loading'}
-            title={modelStatus === 'loading' ? 'Wait for model to load' : 'Start'}
+            title="Start Camera"
             style={{ color: isRunning ? 'var(--accent-green)' : 'inherit' }}>▶️</button>
-          <button className="ctrl-btn" onClick={stopCamera} disabled={!isRunning}>⏸️</button>
-          <button className="ctrl-btn end-call" onClick={handleLogout}>❌</button>
+          
+          <button className="ctrl-btn" onClick={toggleMute} disabled={!isRunning}
+            style={{ color: isMuted ? 'var(--accent-red)' : 'inherit' }}
+            title="Mute Mic">
+            {isMuted ? '🔇' : '🎙️'}
+          </button>
+          
+          <button className="ctrl-btn" onClick={stopCamera} disabled={!isRunning} title="Pause Room">⏸️</button>
+          <button className="ctrl-btn end-call" onClick={handleLogout} title="Leave Session">❌</button>
         </div>
       </section>
 
@@ -535,6 +728,22 @@ const VideoCall = () => {
         <div className="sidebar-header">
           <span className="sidebar-title">Translation & Chat Feed</span>
         </div>
+        
+        <div style={{
+          padding: '12px 14px',
+          borderBottom: '1px solid var(--navy-border)',
+          background: 'rgba(58, 142, 246, 0.04)'
+        }}>
+          <span className="feed-heading" style={{ color: 'var(--accent-cyan)', marginBottom: '6px', display: 'block' }}>
+            System Guide
+          </span>
+          <div style={{ fontSize: '0.68rem', color: 'var(--text-muted)', lineHeight: '1.4', display: 'flex', flexDirection: 'column', gap: '4px' }}>
+            <div>• <strong>Theater View:</strong> Click any user's panel to enlarge their feed.</div>
+            <div>• <strong>Stabilized Window:</strong> Signs verify across consecutive frames.</div>
+            <div>• <strong>Space Trigger:</strong> Show "Space" sign to submit string to chat.</div>
+          </div>
+        </div>
+
         <div className="sign-feed">
           <span className="feed-heading">Activity Log</span>
           <ul className="feed-list">
